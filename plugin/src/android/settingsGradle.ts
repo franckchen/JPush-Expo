@@ -6,9 +6,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ConfigPlugin, withSettingsGradle } from 'expo/config-plugins';
-import { syncGeneratedContents } from '../utils/generateCode';
+import {
+  removeGeneratedContents,
+  syncGeneratedContents,
+} from '../utils/generateCode';
 
 const JPUSH_GRADLE_PACKAGES = ['jpush-react-native', 'jcore-react-native'];
+const JPUSH_MODULES_TAG = 'jpush-modules';
 
 /**
  * 从 app 根目录逐级向上查找依赖的 android 工程目录。
@@ -27,7 +31,8 @@ export function resolveAndroidProjectDir(
   projectRoot: string,
   packageName: string
 ): string {
-  let current = path.resolve(projectRoot);
+  const startDir = path.resolve(projectRoot);
+  let current = startDir;
   while (true) {
     const androidDir = path.join(current, 'node_modules', packageName, 'android');
     if (fs.existsSync(androidDir)) {
@@ -41,7 +46,7 @@ export function resolveAndroidProjectDir(
   }
 
   throw new Error(
-    `[MX_JPush_Expo] 未找到 ${packageName} 的 android 目录:已从 ${projectRoot} 逐级向上查找 node_modules 均未命中。` +
+    `[MX_JPush_Expo] 未找到 ${packageName} 的 android 目录:已从 ${startDir} 逐级向上查找 node_modules 均未命中。` +
       '请先安装 jpush-react-native 与 jcore-react-native(npm / pnpm / yarn install),再重新执行 expo prebuild。'
   );
 }
@@ -55,7 +60,8 @@ const getJPushModules = (projectRoot: string): string => {
   const moduleEntry = (packageName: string): string => {
     const androidDir = resolveAndroidProjectDir(projectRoot, packageName);
     // rootProject.projectDir 即 <app>/android,projectDir 相对它表达,
-    // 生成文件不落盘绝对路径;Windows 下 path.relative 的分隔符统一为 '/'
+    // 生成文件不落盘绝对路径。Windows 上 path.relative 会产出 '\' 分隔符,
+    // 这里统一转成 '/',保证生成的 Gradle 文件跨平台一致
     const relativeDir = path
       .relative(androidRoot, androidDir)
       .split(path.sep)
@@ -72,10 +78,28 @@ export function applyAndroidSettingsGradle(
   contents: string,
   projectRoot: string
 ): string {
+  let jpushModules: string;
+  try {
+    jpushModules = getJPushModules(projectRoot);
+  } catch (error) {
+    // 依赖尚未安装(如 fresh clone 后 expo prebuild --no-install、CI 缓存未命中):
+    // settings.gradle 已有 generated 块时保持 no-op 并提示,避免把本可跳过的
+    // prebuild 变成硬失败;块不存在时仍快速失败并给出安装指引
+    if (removeGeneratedContents(contents, JPUSH_MODULES_TAG) !== null) {
+      console.warn(
+        '\n[MX_JPush_Expo] 未找到 jpush-react-native / jcore-react-native 的 android 目录,' +
+          '保留 settings.gradle 中已有的 JPush 模块配置不做重算。' +
+          '请在安装依赖(npm / pnpm / yarn install)后重新执行 expo prebuild 以刷新模块路径。'
+      );
+      return contents;
+    }
+    throw error;
+  }
+
   return syncGeneratedContents({
     src: contents,
-    newSrc: getJPushModules(projectRoot),
-    tag: 'jpush-modules',
+    newSrc: jpushModules,
+    tag: JPUSH_MODULES_TAG,
     anchor: /include\s+['"]?:app['"]?/,
     offset: -1,
     comment: '//',

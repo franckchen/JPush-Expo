@@ -54,6 +54,31 @@ const createHoistedMonorepoStub = (): string => {
   return monorepoRoot;
 };
 
+/**
+ * 模拟 npm workspaces 的就近命中:依赖同时存在于 apps 层与仓库根,
+ * 应命中更近的一层(与 Node 模块解析的 nearest-wins 语义一致)
+ */
+const createNestedWorkspaceStub = (): string => {
+  const workspaceRoot = trackStubRoot(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-nested-'))
+  );
+  const appRoot = path.join(workspaceRoot, 'apps', 'mobile');
+
+  fs.mkdirSync(path.join(appRoot, 'android'), { recursive: true });
+  for (const packageName of JPUSH_GRADLE_PACKAGES) {
+    fs.mkdirSync(
+      path.join(workspaceRoot, 'apps', 'node_modules', packageName, 'android'),
+      { recursive: true }
+    );
+    fs.mkdirSync(
+      path.join(workspaceRoot, 'node_modules', packageName, 'android'),
+      { recursive: true }
+    );
+  }
+
+  return workspaceRoot;
+};
+
 afterEach(() => {
   while (tempStubRoots.length > 0) {
     const stubRoot = tempStubRoots.pop();
@@ -329,12 +354,16 @@ describe('Android transforms', () => {
 
     const transformed = applyAndroidSettingsGradle(fixture, appRoot);
 
-    expect(transformed).toContain(
-      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jpush-react-native/android')"
-    );
-    expect(transformed).toContain(
-      "project(':jcore-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jcore-react-native/android')"
-    );
+    // 旧版 getJPushModules() 的完整字面量:整块比对,证明存量用户的
+    // settings.gradle 不会因升级插件而出现无谓 diff
+    const legacyModuleBlock = [
+      "include ':jpush-react-native'",
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jpush-react-native/android')",
+      '',
+      "include ':jcore-react-native'",
+      "project(':jcore-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jcore-react-native/android')",
+    ].join('\n');
+    expect(transformed).toContain(legacyModuleBlock);
   });
 
   it('should resolve JPush modules from the hoisted monorepo root', () => {
@@ -370,8 +399,65 @@ describe('Android transforms', () => {
     );
   });
 
+  it('should re-resolve module paths when moving from a hoisted monorepo back to a single app', () => {
+    // 反向迁移:hoisted → single-app,同样要求旧块被替换而不是原样保留
+    const appRoot = createClassicAppStub();
+    const monorepoRoot = createHoistedMonorepoStub();
+    const hoistedAppRoot = path.join(monorepoRoot, 'packages', 'app');
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const hoisted = applyAndroidSettingsGradle(fixture, hoistedAppRoot);
+    const migrated = applyAndroidSettingsGradle(hoisted, appRoot);
+
+    expect(migrated.match(/include ':jpush-react-native'/g)).toHaveLength(1);
+    expect(migrated).toContain(
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jpush-react-native/android')"
+    );
+  });
+
+  it('should resolve the nearest node_modules when dependencies exist at multiple levels', () => {
+    // Node 解析是 nearest-wins:apps 层与仓库根都有依赖时,必须命中更近的一层,
+    // 否则会与 Metro 在 JS 侧解析到的副本错位
+    const workspaceRoot = createNestedWorkspaceStub();
+    const appRoot = path.join(workspaceRoot, 'apps', 'mobile');
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const transformed = applyAndroidSettingsGradle(fixture, appRoot);
+
+    expect(transformed).toContain(
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../../node_modules/jpush-react-native/android')"
+    );
+  });
+
+  it('should keep the existing generated block when dependencies are missing', () => {
+    // 依赖未安装时(如 fresh clone 后 expo prebuild --no-install、CI 缓存未命中),
+    // settings.gradle 已有 generated 块的 prebuild 应保持 no-op,而不是硬失败;
+    // 块不存在时仍应快速失败(由上一个用例覆盖)
+    const appRoot = createClassicAppStub();
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const generated = applyAndroidSettingsGradle(fixture, appRoot);
+    fs.rmSync(path.join(appRoot, 'node_modules'), {
+      recursive: true,
+      force: true,
+    });
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const preserved = applyAndroidSettingsGradle(generated, appRoot);
+      expect(preserved).toBe(generated);
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it('should fail with an actionable error when JPush dependencies are missing', () => {
-    const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-empty-'));
+    // 查找会自 app 根逐级走到文件系统根,本用例隐含假设 os.tmpdir() 的祖先链上
+    // 恰好没有 node_modules/jpush-react-native(macOS /var/folders、Linux /tmp 均满足)
+    const appRoot = trackStubRoot(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-empty-'))
+    );
     const fixture = readFixture('android/settings.gradle.fixture');
 
     expect(() => applyAndroidSettingsGradle(fixture, appRoot)).toThrow(
