@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { applyAndroidManifestMetaData } from '../src/android/androidManifest';
 import { applyAndroidAppBuildGradle } from '../src/android/appBuildGradle';
@@ -9,6 +10,58 @@ import { mergeContents } from '../src/utils/generateCode';
 
 const readFixture = (fixturePath: string): string =>
   fs.readFileSync(path.join(__dirname, 'fixtures', fixturePath), 'utf8');
+
+const JPUSH_GRADLE_PACKAGES = ['jpush-react-native', 'jcore-react-native'];
+
+const tempStubRoots: string[] = [];
+
+const trackStubRoot = (root: string): string => {
+  tempStubRoots.push(root);
+  return root;
+};
+
+/** 模拟依赖安装在应用自身 node_modules 下的经典单应用布局 */
+const createClassicAppStub = (): string => {
+  const appRoot = trackStubRoot(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-app-'))
+  );
+
+  fs.mkdirSync(path.join(appRoot, 'android'), { recursive: true });
+  for (const packageName of JPUSH_GRADLE_PACKAGES) {
+    fs.mkdirSync(path.join(appRoot, 'node_modules', packageName, 'android'), {
+      recursive: true,
+    });
+  }
+
+  return appRoot;
+};
+
+/** 模拟 pnpm node-linker=hoisted / yarn workspace:依赖提升到 monorepo 根 */
+const createHoistedMonorepoStub = (): string => {
+  const monorepoRoot = trackStubRoot(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-monorepo-'))
+  );
+  const appRoot = path.join(monorepoRoot, 'packages', 'app');
+
+  fs.mkdirSync(path.join(appRoot, 'android'), { recursive: true });
+  for (const packageName of JPUSH_GRADLE_PACKAGES) {
+    fs.mkdirSync(
+      path.join(monorepoRoot, 'node_modules', packageName, 'android'),
+      { recursive: true }
+    );
+  }
+
+  return monorepoRoot;
+};
+
+afterEach(() => {
+  while (tempStubRoots.length > 0) {
+    const stubRoot = tempStubRoots.pop();
+    if (stubRoot) {
+      fs.rmSync(stubRoot, { recursive: true, force: true });
+    }
+  }
+});
 
 const TEST_APP_KEY = 'demo-app-key';
 const TEST_CHANNEL = 'demo-channel';
@@ -259,13 +312,71 @@ describe('Android transforms', () => {
   });
 
   it('should inject settings.gradle modules only once', () => {
+    const appRoot = createClassicAppStub();
     const fixture = readFixture('android/settings.gradle.fixture');
-    const transformed = applyAndroidSettingsGradle(fixture);
-    const repeated = applyAndroidSettingsGradle(transformed);
+    const transformed = applyAndroidSettingsGradle(fixture, appRoot);
+    const repeated = applyAndroidSettingsGradle(transformed, appRoot);
 
     expect(transformed).toContain(`include ':jpush-react-native'`);
     expect(transformed).toContain(`include ':jcore-react-native'`);
     expect(repeated.match(/include ':jpush-react-native'/g)).toHaveLength(1);
+    expect(repeated).toBe(transformed);
+  });
+
+  it('should keep single-app layouts byte-identical to previous releases', () => {
+    const appRoot = createClassicAppStub();
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const transformed = applyAndroidSettingsGradle(fixture, appRoot);
+
+    expect(transformed).toContain(
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jpush-react-native/android')"
+    );
+    expect(transformed).toContain(
+      "project(':jcore-react-native').projectDir = new File(rootProject.projectDir, '../node_modules/jcore-react-native/android')"
+    );
+  });
+
+  it('should resolve JPush modules from the hoisted monorepo root', () => {
+    const monorepoRoot = createHoistedMonorepoStub();
+    const appRoot = path.join(monorepoRoot, 'packages', 'app');
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const transformed = applyAndroidSettingsGradle(fixture, appRoot);
+
+    expect(transformed).toContain(`include ':jpush-react-native'`);
+    expect(transformed).toContain(
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../../../node_modules/jpush-react-native/android')"
+    );
+    expect(transformed).toContain(
+      "project(':jcore-react-native').projectDir = new File(rootProject.projectDir, '../../../node_modules/jcore-react-native/android')"
+    );
+  });
+
+  it('should re-resolve module paths when the project moves between layouts', () => {
+    // 幂等不等于路径固化:同一份 settings.gradle 在 single-app 与 hoisted
+    // 布局之间迁移时,旧的 generated 区段需要被替换为新路径,而不是原样保留
+    const appRoot = createClassicAppStub();
+    const monorepoRoot = createHoistedMonorepoStub();
+    const hoistedAppRoot = path.join(monorepoRoot, 'packages', 'app');
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    const classic = applyAndroidSettingsGradle(fixture, appRoot);
+    const migrated = applyAndroidSettingsGradle(classic, hoistedAppRoot);
+
+    expect(migrated.match(/include ':jpush-react-native'/g)).toHaveLength(1);
+    expect(migrated).toContain(
+      "project(':jpush-react-native').projectDir = new File(rootProject.projectDir, '../../../node_modules/jpush-react-native/android')"
+    );
+  });
+
+  it('should fail with an actionable error when JPush dependencies are missing', () => {
+    const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mx-jpush-empty-'));
+    const fixture = readFixture('android/settings.gradle.fixture');
+
+    expect(() => applyAndroidSettingsGradle(fixture, appRoot)).toThrow(
+      /未找到 jpush-react-native 的 android 目录/
+    );
   });
 
   it('should add AndroidManifest metadata and keep it idempotent', () => {
